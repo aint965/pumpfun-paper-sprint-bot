@@ -2,12 +2,19 @@
 //
 // Idea: most pump.fun coins die within seconds of launch, but the launches
 // that attract real money in their first seconds keep pumping for a little
-// while. This bot buys only hot fresh launches (within 6 slots of their
-// CreateEvent, real SOL reserves already 3-30 SOL, creator bought at most
-// 2.5 SOL at launch, 2-3 distinct outside buyers so it is not a bundled
-// cluster, creator has not sold, and the most recent trade is a buy), then
+// while. This bot buys only hot fresh launches (within 8 slots of their
+// CreateEvent, real SOL reserves already 3-40 SOL, creator bought at most
+// 3 SOL at launch, 2-4 distinct outside buyers so it is not a bundled
+// cluster, creator has not sold, and the last two trades are buys), then
 // exits fast and whole: take profit at +20%, stop loss at -8%, out after
-// 10 slots (~2 s) if neither fired, and out at once if the creator sells.
+// 10 slots (~4 s) if neither fired, and out at once if the creator sells.
+//
+// The entry filter has one extra guard that matters: orders decided on
+// slot s fill at slot s+2, so a coin that just went vertical fills at the
+// top and retraces into the buy. The bot skips any coin whose price rose
+// more than 15% over its last 3 trades and only buys a steady climb.
+// That one guard cut the per-trade loss from about -0.0023 SOL to about
+// -0.0013 SOL on the dev window while keeping the coin count high.
 //
 // Why this shape, found by grading revisions on the dev window: the round
 // trip costs about 2.5% in curve fees (95 bps protocol + 30 bps creator,
@@ -15,14 +22,17 @@
 // several percent to clear fees. The 1%-of-real-reserve buy cap is the
 // binding size limit, which is why the entry requires 3+ SOL of real
 // reserves: on cold launches the cap only allows a dust-sized buy whose
-// tx fee eats the trade. Letting winners ride was tried twice (sell half
-// at +25%, trail the rest) and lost both times: these coins mostly retrace
-// to cost, so banking +20% whole beats the trail. Likewise a longer hold
-// (30 slots), a tighter stop (-5%) and a bigger stake (0.15 SOL) all scored
-// worse on the dev window than the shipped settings.
+// tx fee eats the trade. Letting winners ride was tried (sell half at
+// +25% and trail, TP +40% with a 20-slot hold) and lost both times: these
+// coins mostly retrace to cost, so banking +20% whole beats the trail.
+// Likewise a longer hold (30 slots), a tighter stop (-5%), a lower take
+// profit (+15%) and cutting slow bleeders early all scored worse than the
+// shipped settings, as did widening the buyer filter to 5-6 distinct
+// buyers: the extra coins those filters add lose more per trade than the
+// ones the shipped filter keeps.
 //
-// Dev-window result (grade-local, process driver): net PnL about -0.20 SOL
-// over 99 coins / 99 round trips, win rate ~24%, max drawdown ~2.4%,
+// Dev-window result (grade-local, process driver): net PnL about -0.18 SOL
+// over 138 coins / 138 round trips, win rate ~23%, max drawdown ~2.2%,
 // guardrails met. That is still slightly negative on this window, and
 // honest about it: the pilot sniper baseline scores -0.42 SOL on the same
 // window, the momentum pilot -9.45 SOL and the reversion pilot about
@@ -58,6 +68,9 @@ interface Tick {
   isBuy: boolean;
   sol: bigint;
   user: Pubkey;
+  /** Virtual reserves after this trade: price is vq / vt. */
+  vq: bigint;
+  vt: bigint;
 }
 
 interface Coin {
@@ -114,7 +127,7 @@ function readEvents(batch: Batch): void {
       const c = coins.get(e.mint);
       if (c === undefined) continue;
       const sol = BigInt(e.sol_amount);
-      c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
+      c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user, vq: BigInt(e.virtual_quote_reserves), vt: BigInt(e.virtual_token_reserves) });
       if (c.recent.length > 40) c.recent.splice(0, c.recent.length - 40);
       const isDev = e.user === c.creator;
       if (e.is_buy) {
@@ -216,7 +229,7 @@ await runBot({
       if (orders.length >= cap) break;
       if (c.done || c.complete || c.entered) continue;
       const age = state.slot - c.createSlot;
-      if (age > 6) {
+      if (age > 8) {
         c.done = true; // launch window closed: never chase an old coin as a snipe
         continue;
       }
@@ -228,12 +241,23 @@ await runBot({
         continue;
       }
       const rq = curve.real_quote_reserves;
-      if (rq < 3_000_000_000n || rq > 30_000_000_000n) continue; // 3 .. 30 SOL real: hot enough that the 1% cap allows a real stake
-      if (c.devBuy > 2_500_000_000n) continue; // creator bought more than 2.5 SOL at launch
-      if (c.buyers.size < 2 || c.buyers.size > 3) continue; // at least two outsiders, not a bundle
-      // Buyers are still stepping in: the most recent trade must be a buy.
-      const lastTick = c.recent[c.recent.length - 1];
-      if (lastTick === undefined || !lastTick.isBuy) continue;
+      if (rq < 3_000_000_000n || rq > 40_000_000_000n) continue; // 3 .. 40 SOL real: hot enough that the 1% cap allows a real stake
+      if (c.devBuy > 3_000_000_000n) continue; // creator bought more than 3 SOL at launch
+      if (c.buyers.size < 2 || c.buyers.size > 4) continue; // at least two outsiders, not a bundle
+      // Buyers are still stepping in: the last two trades must both be buys,
+      // so a single stray buy after the burst ended does not trigger an entry.
+      const n = c.recent.length;
+      const lastTick = c.recent[n - 1];
+      const prevTick = c.recent[n - 2];
+      if (lastTick === undefined || prevTick === undefined || !lastTick.isBuy || !prevTick.isBuy) continue;
+      // Latency tax: our buy fills 2 slots after we decide, so a coin that
+      // just went vertical (+15% over its last 3 trades) fills at the top
+      // and retraces into us. Only buy a steady climb, not a spike.
+      const thirdTick = c.recent[n - 3];
+      if (thirdTick !== undefined && thirdTick.vt > 0n && lastTick.vt > 0n) {
+        // pNow / p3ago = (vqNow/vtNow) / (vq3/vt3) > 1.15  <=>  skip
+        if (lastTick.vq * thirdTick.vt * 100n > thirdTick.vq * lastTick.vt * 115n) continue;
+      }
       const stake = 100_000_000n; // 0.1 SOL
       const maxBuy = (state.maxBuyLamports(c.mint) * 97n) / 100n;
       const amount = stake < maxBuy ? stake : maxBuy;
